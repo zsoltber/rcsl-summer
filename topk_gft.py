@@ -156,17 +156,31 @@ def gft_train (
     best_acc = 77.55
     loss_history = []
     accuracy_history = []
-    N = len(X_train) 
-    
+    N = len(X_train)
+
     if N < batch_size:
         raise ValueError(f"batch_size ({batch_size}) cannot exceed dataset size ({N})")
-    
+
+    # precompute per-class index arrays for stratified sampling
+    classes = np.unique(y_train)
+    n_classes = len(classes)
+    class_idx = [np.where(y_train == c)[0] for c in classes]
+    samples_per_class = batch_size // n_classes
+    remainder = batch_size % n_classes
+
     for t in range(total_iterations):
         # Scheduler linearly decreasing mod. frac. as iterations progress
         k_frac = k_start + (k_end - k_start) * (t / total_iterations)
-        
-        # sample mini batch from dataset
-        idx = rng.choice(N, size=batch_size, replace=False)
+
+        # stratified batch sampling: draw samples_per_class from each class
+        parts = [
+            rng.choice(ci, size=samples_per_class, replace=len(ci) < samples_per_class)
+            for ci in class_idx
+        ]
+        if remainder:
+            extra_classes = rng.choice(n_classes, size=remainder, replace=False)
+            parts += [rng.choice(class_idx[ec], size=1) for ec in extra_classes]
+        idx = np.concatenate(parts)
         X_batch = X_train[idx]
         y_batch = y_train[idx]
         
