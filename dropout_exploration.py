@@ -2,8 +2,10 @@ import numpy as np
 import sys
 sys.path.insert(1, "/home/xilinx/jupyter_notebooks/ContinualLearningMB")
 from utils import hil_validation # runs on PL validation using given set of weights
-from finn_pack_npy_only import pack_layer # method converting a single .npy file into a FINN .dat file
+from finn_pack_npy_only import pack_layer
 import os
+import json
+from collections import defaultdict
 
 rng = np.random.default_rng(seed=42) # reproducability of runs
 
@@ -11,8 +13,6 @@ rng = np.random.default_rng(seed=42) # reproducability of runs
 # target_fps_k = 100
 # starting_weight_dir = f""
 # starting_weights = [np.load(os.path.join(starting_weight_dir, f"{x+1}_0_StreamingDataflowPartition_{x+1}_MatrixVectorActivation_0.dat") for x in range(len(weights))]
-L = len(starting_weights)
-baseline_accuracy = hil_validation(starting_weights)
 
 def dynamic_probability (topk_mat, p_min=0.001):
     d_max = topk_mat.max()
@@ -35,23 +35,51 @@ def dynamic_probability (topk_mat, p_min=0.001):
 
     return prob
 
-def dropout_select (weights, baseline_accuracy, population_size, pruning_rate, modification_type, k, p_min):
-    MODIFICATION_TYPES = ["Prune", "Half", "SignFlip", "ShiftToZero"]
+def prune_mod (layer, mask):
+    return np.where(mask, 0, layer)
+
+def half_mod (layer, mask):
+    return np.where(mask, layer // 2, layer)
+
+def sign_flip_mod (layer, mask):
+    return np.where(mask, (-1) * layer, layer)
+
+def shift_to_zero_mod (layer, mask):
+    return np.where(mask, layer - np.sign(layer), layer)
+
+def dropout_select (weights, population_size, pruning_rate, modification_type, k=None, p_min=0.005):
+    if k is None:
+        k = pruning_rate / 2
+        
+    MODIFICATION_TYPES = ["Prune", "Half", "SignFlip", "ShiftToZero", "All"]
     assert modification_type in MODIFICATION_TYPES, "Selected modification type not found."
+    val_dir = "deploy/driver/hil_validation/b4_100k"
+    
+    L = len(weights)
+    baseline_accuracy = hil_validation(weights)
     
     damage = [np.zeros_like(w) for w in weights]
-    modified_weights = []
+    modified_weights = defaultdict(list) if modification_type == "All" else []
+    
+    weights_json = "deploy/driver/runtime_weights_initial/b4_100k/weights.json"
+    with open(weights_json, "r") as f:
+        layer_info = json.load(f)
 
     # accumulate damages for each layer by testing population sizes
     # the damage list aggregates weight effects on final accuracy to identify if there are any weights
     # that the network in its current state is better without or ones that are crucial for a correct prediction
     for layer_id in range(L):
         k_count = max(1, int(k * weights[layer_id].size))
+        pe = layer_info[f"MatrixVectorActivation_{layer_id}"]["PE"]
+        simd = layer_info[f"MatrixVectorActivation_{layer_id}"]["SIMD"]
+        wdt = layer_info[f"MatrixVectorActivation_{layer_id}"]["WDT"]
+        
+        layer_dat_output = os.path.join(val_dir, f"{layer_id + 1}_0_StreamingDataflowPartition_{layer_id + 1}_MatrixVectorActivation_0.dat")
         
         # test population_size random dropout patterns to identify damaging weights in current layer
         for p in range(population_size):
             pruning_filter = rng.choice([True, False], weights[layer_id].shape, p=[pruning_rate, 1 - pruning_rate]) # create a mask for pruning_rate*100% of weights
-
+          
             # new_w_layer is a copy of a given layer
             pruned_layer = weights[layer_id].copy()
             pruned_layer[pruning_filter] = 0 # prune copy for testing
@@ -59,12 +87,16 @@ def dropout_select (weights, baseline_accuracy, population_size, pruning_rate, m
             # copy a set of all weights and place the pruned layer back among the originals
             new_weights = list(weights)
             new_weights[layer_id] = pruned_layer
+            
+            # replace layer in HIL folder with pruned version - only recompute the current layer
+            pack_layer(pruned_layer, layer_dat_output, pe, simd, wdt)
 
             # run HIL validation on the dataset on the FPGA to determine accuracy change due to pruning
-            accuracy = hil_validation(new_weights)
+            accuracy = hil_validation()
 
             # delta is new accuracy vs baseline
             delta_acc = accuracy - baseline_accuracy
+            print(f"Delta for layer {layer_id + 1}, population member {p + 1}: {delta_acc:.2f}%")
 
             # the set of pruned test weights are marked as destructive i.e. hurting output if 
             # their removal improves model performance
@@ -89,35 +121,25 @@ def dropout_select (weights, baseline_accuracy, population_size, pruning_rate, m
 
         # modify weights according to shifting style
         mod_layer = weights[layer_id]
-        if modification_type == "Prune":
-            mod_layer = np.where(
-                mod_mask,
-                0,
-                mod_layer
-            )
+        if modification_type == "All":
+            modified_weights["Prune"].append(prune_mod(mod_layer, mod_mask))
+            modified_weights["Half"].append(half_mod(mod_layer, mod_mask))
+            modified_weights["SignFlip"].append(sign_flip_mod(mod_layer, mod_mask))
+            modified_weights["ShiftToZero"].append(shift_to_zero_mod(mod_layer, mod_mask))
+        elif modification_type == "Prune":
+            mod_layer = prune_mod(mod_layer, mod_mask)
+            modified_weights.append(mod_layer)
         elif modification_type == "Half":
-            mod_layer = np.where(
-                mod_mask,
-                mod_layer // 2  ,
-                mod_layer
-            )
+            mod_layer = half_mod(mod_layer, mod_mask)
+            modified_weights.append(mod_layer)
         elif modification_type == "SignFlip":
-            mod_layer = np.where(
-                mod_mask,
-                (-1) * mod_layer,
-                mod_layer
-            )
+            mod_layer = sign_flip_mod(mod_layer, mod_mask)
+            modified_weights.append(mod_layer)
         else: # ShiftToZero 
-            mod_layer = np.where(
-                mod_mask,
-                mod_layer - np.sign(mod_layer),
-                mod_layer
-            )
+            mod_layer = shift_to_zero_mod(mod_layer, mod_mask)
+            modified_weights.append(mod_layer)
         
-        modified_weights.append(mod_layer)
-
-    acc = hil_validation(modified_weights) # runs an eval with new weights on the test dataset
-    print(f"Accuracy of modified weights: {acc:.2f}%")
+        pack_layer(weights[layer_id], layer_dat_output, pe, simd, wdt) # reset layer to original
 
     return modified_weights
         
