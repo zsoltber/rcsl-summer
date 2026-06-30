@@ -59,8 +59,8 @@ def run_hardware_tuning_loop(
         full_weights_shaped = full_weights.reshape(baseline.shape).astype(np.int8)
 
         # ↓ your existing pipeline
-        pack_to_dat(full_weights_shaped, "candidate.dat")
-        load_onto_fpga("candidate.dat")
+        pack_layer(full_weights_shaped, "candidate.dat")
+        # load_onto_fpga("candidate.dat") -> accel.load_runtime_weights() on an existing FINNExampleOverlay object
         loss = 1.0 - pl_acc_eval()
         loss_history.append(loss)
 
