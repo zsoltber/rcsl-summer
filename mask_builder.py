@@ -70,7 +70,7 @@ CHUNK             = 64        # samples per executor call (falls back to 1)
 # the layer as (n_out, n_in). If your DE-side arrays are (n_out, n_in), set
 # this True so the saved mask is transposed to match. VERIFY on a layer with
 # n_in != n_out before trusting any result.
-TRANSPOSE_FOR_HW  = True
+TRANSPOSE_FOR_HW  = False
 
 OUTPUT_PATH       = "stage_a_mask.npz"
 RNG               = np.random.default_rng(1234)
