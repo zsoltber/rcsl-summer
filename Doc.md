@@ -1,4 +1,4 @@
-# Docs for my 6 week research work at RCSL
+# Docs
 
 ## Algorithms
 
